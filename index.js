@@ -8,17 +8,17 @@ const cookieSession = require("cookie-session");
 const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// --- SESSION SETUP (Cookies) ---
+// --- SESSION SETUP ---
 app.use(cookieSession({
   name: 'session',
-  keys: [process.env.SESSION_SECRET || 'secret_key_123'], // Simple encryption key
+  keys: [process.env.SESSION_SECRET || 'secret_key_123'],
   maxAge: 24 * 60 * 60 * 1000 // 24 hours
 }));
 
 // --- CONFIGURATION ---
 const NOTION_CLIENT_ID = process.env.NOTION_CLIENT_ID;
 const NOTION_CLIENT_SECRET = process.env.NOTION_CLIENT_SECRET;
-const NOTION_REDIRECT_URI = process.env.NOTION_REDIRECT_URI; // e.g. https://.../auth/notion/callback
+const NOTION_REDIRECT_URI = process.env.NOTION_REDIRECT_URI;
 const NOTION_VERSION = "2025-09-03"; 
 const DEFAULT_PROPERTY = "WidgetValue"; 
 
@@ -28,10 +28,9 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// --- INIT DB (UPDATED FOR USERS) ---
+// --- INIT DB ---
 async function initDB() {
   try {
-    // 1. Create USERS Table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id TEXT PRIMARY KEY,
@@ -40,8 +39,6 @@ async function initDB() {
         bot_id TEXT
       );
     `);
-    
-    // 2. Create WIDGETS Table (With user_id link)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS widgets (
         id TEXT PRIMARY KEY,
@@ -52,7 +49,8 @@ async function initDB() {
         subtext TEXT,
         db_id TEXT,
         property TEXT,
-        manual_value TEXT
+        manual_value TEXT,
+        calculation TEXT 
       );
     `);
     console.log("✅ Database tables ready.");
@@ -62,8 +60,7 @@ async function initDB() {
 }
 initDB();
 
-// --- AUTH MIDDLEWARE ---
-// Forces user to login if they try to access Dashboard
+// --- MIDDLEWARE ---
 function requireAuth(req, res, next) {
   if (!req.session || !req.session.userId) {
     return res.redirect('/login');
@@ -71,12 +68,12 @@ function requireAuth(req, res, next) {
   next();
 }
 
-// --- NOTION API: DYNAMIC TOKEN ---
-// Now takes 'accessToken' instead of using env var
-async function getNotionSum(accessToken, databaseId, propertyName) {
+// --- NOTION API: AGGREGATOR ---
+async function getNotionAggregatedValue(accessToken, databaseId, propertyName, calculationType) {
   try {
     if (!accessToken) return 0;
     const targetProp = propertyName || DEFAULT_PROPERTY;
+    const calc = calculationType || "sum"; 
 
     const headers = {
       Authorization: `Bearer ${accessToken}`,
@@ -84,7 +81,6 @@ async function getNotionSum(accessToken, databaseId, propertyName) {
       "Content-Type": "application/json",
     };
 
-    // 1. Get Data Sources
     let dataSources = [];
     try {
       const dbResponse = await axios.get(
@@ -98,7 +94,8 @@ async function getNotionSum(accessToken, databaseId, propertyName) {
       return null;
     }
 
-    let totalSum = 0;
+    let values = [];
+    
     for (const source of dataSources) {
       try {
         const queryUrl = `https://api.notion.com/v1/data_sources/${source.id}/query`;
@@ -106,217 +103,540 @@ async function getNotionSum(accessToken, databaseId, propertyName) {
 
         for (const page of response.data.results) {
           const prop = page.properties[targetProp];
-          if (!prop) continue; 
-          if (prop.type === "formula" && prop.formula.type === "number") {
-            totalSum += prop.formula.number || 0;
-          } else if (prop.type === "number") {
-            totalSum += prop.number || 0;
+          let num = null;
+          if (prop) {
+            if (prop.type === "formula" && prop.formula.type === "number") {
+              num = prop.formula.number;
+            } else if (prop.type === "number") {
+              num = prop.number;
+            }
           }
+          if (num !== null) values.push(num);
         }
-      } catch (innerError) {
-        // console.error(`Source Error:`, innerError.message);
-      }
+      } catch (innerError) { /* ignore */ }
     }
-    return totalSum; 
+
+    if (values.length === 0) return 0;
+
+    if (calc === "sum") return values.reduce((a, b) => a + b, 0);
+    if (calc === "average") return values.reduce((a, b) => a + b, 0) / values.length;
+    if (calc === "count") return values.length;
+    if (calc === "min") return Math.min(...values);
+    if (calc === "max") return Math.max(...values);
+    
+    return 0;
   } catch (error) {
     console.error("Critical Error:", error.message);
     return null;
   }
 }
 
-// --- ROUTES: AUTHENTICATION ---
+// --- API: LIST DATABASES ---
+app.get('/api/databases', requireAuth, async (req, res) => {
+  try {
+    const uRes = await pool.query("SELECT access_token FROM users WHERE id = $1", [req.session.userId]);
+    const user = uRes.rows[0];
+    if (!user) return res.status(401).json({ error: "User not found" });
 
-// 1. Login Page (Landing)
+    const response = await axios.post('https://api.notion.com/v1/search', 
+      {
+        filter: { value: 'database', property: 'object' },
+        sort: { direction: 'descending', timestamp: 'last_edited_time' }
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${user.access_token}`,
+          'Notion-Version': NOTION_VERSION,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    const databases = response.data.results.map(db => ({
+      id: db.id,
+      title: db.title && db.title.length > 0 ? db.title[0].plain_text : "Untitled Database",
+      icon: db.icon ? (db.icon.emoji || "📄") : "📄"
+    }));
+
+    res.json(databases);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch databases" });
+  }
+});
+
+// --- API: GET PROPERTIES (New Feature) ---
+app.get('/api/properties', requireAuth, async (req, res) => {
+  try {
+    const { dbId } = req.query;
+    if(!dbId) return res.json([]);
+
+    const uRes = await pool.query("SELECT access_token FROM users WHERE id = $1", [req.session.userId]);
+    const user = uRes.rows[0];
+
+    // Fetch Database Schema
+    const response = await axios.get(`https://api.notion.com/v1/databases/${dbId}`, {
+      headers: {
+        'Authorization': `Bearer ${user.access_token}`,
+        'Notion-Version': NOTION_VERSION,
+      }
+    });
+
+    // Extract Number and Formula properties
+    const properties = response.data.properties;
+    const validProps = Object.keys(properties).filter(key => {
+      const type = properties[key].type;
+      // We accept Numbers or Formulas (assuming formula is number type, which we can't fully know without checking, but we list all formulas)
+      return type === 'number' || type === 'formula';
+    });
+
+    res.json(validProps);
+  } catch (error) {
+    console.error(error);
+    res.json([]);
+  }
+});
+
+
+// --- UI: LOGIN ---
 app.get('/login', (req, res) => {
   res.send(`
-    <body style="font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; background:#f9f9f9;">
-      <div style="text-align:center; background:white; padding:40px; border-radius:8px; box-shadow:0 4px 20px rgba(0,0,0,0.1);">
-        <h1>📊 Notion Widget Hub</h1>
-        <p>Connect your Notion workspace to start creating widgets.</p>
-        <a href="/auth/notion" style="background:black; color:white; padding:12px 24px; text-decoration:none; border-radius:4px; font-weight:bold;">Continue with Notion</a>
-      </div>
-    </body>
+    <html>
+      <head>
+        <title>Cookie Card Login</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <style>
+          body { background-color: #F8F9FE; height: 100vh; display: flex; align-items: center; justify-content: center; }
+          .login-card { background: white; border-radius: 15px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); padding: 40px; text-align: center; max-width: 400px; width: 100%; border-top: 5px solid #C69C6D; }
+          .btn-cookie { background-color: #4A3B32; color: #fff; border: none; padding: 10px 20px; border-radius: 5px; font-weight: 600; width: 100%; transition: all 0.2s; }
+          .btn-cookie:hover { background-color: #C69C6D; color: white; transform: translateY(-2px); }
+          .logo-text { font-weight: 800; color: #4A3B32; font-size: 24px; margin-bottom: 5px; }
+          .sub-text { color: #8898aa; font-size: 14px; margin-bottom: 30px; }
+        </style>
+      </head>
+      <body>
+        <div class="login-card">
+           <div class="logo-text">🍪 Cookie Card</div>
+           <div class="sub-text">Brought to you by Digital Cookie</div>
+           <p style="color:#525f7f; margin-bottom:30px;">Turn your Notion databases into beautiful dashboard widgets.</p>
+           <a href="/auth/notion" class="btn btn-cookie">Connect Notion Workspace</a>
+        </div>
+      </body>
+    </html>
   `);
 });
 
-// 2. Redirect to Notion
 app.get('/auth/notion', (req, res) => {
   const notionAuthUrl = `https://api.notion.com/v1/oauth/authorize?client_id=${NOTION_CLIENT_ID}&response_type=code&owner=user&redirect_uri=${encodeURIComponent(NOTION_REDIRECT_URI)}`;
   res.redirect(notionAuthUrl);
 });
 
-// 3. Callback (Notion sends user back here)
 app.get('/auth/notion/callback', async (req, res) => {
   const code = req.query.code;
-  if (!code) return res.send("Error: No code received from Notion");
+  if (!code) return res.send("Error: No code");
 
   try {
-    // Exchange Code for Token
     const authString = Buffer.from(`${NOTION_CLIENT_ID}:${NOTION_CLIENT_SECRET}`).toString('base64');
     const response = await axios.post('https://api.notion.com/v1/oauth/token', {
       grant_type: 'authorization_code',
       code: code,
       redirect_uri: NOTION_REDIRECT_URI
     }, {
-      headers: {
-        'Authorization': `Basic ${authString}`,
-        'Content-Type': 'application/json'
-      }
+      headers: { 'Authorization': `Basic ${authString}`, 'Content-Type': 'application/json' }
     });
 
     const { access_token, bot_id, owner, workspace_name } = response.data;
-    const userId = owner.user.id; // Unique Notion User ID
+    const userId = owner.user.id; 
 
-    // Save/Update User in DB
     await pool.query(`
       INSERT INTO users (id, access_token, workspace_name, bot_id)
       VALUES ($1, $2, $3, $4)
-      ON CONFLICT (id) DO UPDATE 
-      SET access_token = $2, workspace_name = $3;
+      ON CONFLICT (id) DO UPDATE SET access_token = $2, workspace_name = $3;
     `, [userId, access_token, workspace_name || "My Workspace", bot_id]);
 
-    // Set Session
     req.session.userId = userId;
-    
     res.redirect('/');
   } catch (error) {
-    console.error(error.response?.data || error.message);
-    res.send("Error logging in with Notion.");
+    res.send("Error logging in.");
   }
 });
 
-// 4. Logout
 app.get('/logout', (req, res) => {
   req.session = null;
   res.redirect('/login');
 });
 
-
-// --- ROUTES: DASHBOARD (PROTECTED) ---
+// --- UI: DASHBOARD (Argon/Cookie Style) ---
 app.get("/", requireAuth, async (req, res) => {
   const userId = req.session.userId;
-  
-  // Fetch widgets ONLY for this user
   const result = await pool.query("SELECT * FROM widgets WHERE user_id = $1", [userId]);
   const widgets = result.rows;
+  const baseUrl = `${req.headers['x-forwarded-proto'] || req.protocol}://${req.headers.host}`;
 
-  const protocol = req.headers['x-forwarded-proto'] || req.protocol;
-  const baseUrl = `${protocol}://${req.headers.host}`;
-
-  const rows = widgets.map(w => {
-    const embedUrl = `${baseUrl}/embed/${w.id}`;
-    return `
-      <tr style="border-bottom: 1px solid #ddd;">
-        <td style="padding:15px;">
-           <div style="font-weight:bold;">${w.title}</div>
-           <div style="font-size:12px; color:#666;">${w.db_id ? "Live Data" : "Manual"}</div>
-        </td>
-        <td style="padding:15px;">
-           <input type="text" value="${embedUrl}" style="width:100%; padding:5px; font-size:11px; background:#f0f0f0;" readonly onclick="this.select()">
-        </td>
-        <td style="padding:15px;">
-          <a href="/edit/${w.id}" style="text-decoration:none; color:#007bff; margin-right:10px;">Edit</a>
-          <form action="/delete" method="POST" style="display:inline;">
-            <input type="hidden" name="id" value="${w.id}">
-            <button type="submit" style="color:red; background:none; border:none; cursor:pointer;">✖</button>
-          </form>
-        </td>
-      </tr>
-    `;
-  }).join("");
-
-  res.send(`
-    <body style="font-family: sans-serif; padding: 40px; max-width: 900px; margin: 0 auto; background: #f9f9f9;">
-      <div style="background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.05);">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-           <h2>📊 Notion Widget Hub</h2>
-           <a href="/logout" style="font-size:12px; color:red;">Logout</a>
-        </div>
-        <hr style="border:0; border-top:1px solid #eee; margin: 20px 0;">
-
-        <div style="background:#f4f4f4; padding:20px; border-radius:8px; border:1px dashed #ccc; margin-bottom:30px;">
-          <h3 style="margin-top:0;">➕ Add Widget</h3>
-          <form action="/add" method="POST">
-            <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px;">
-              <div><label style="font-size:11px; font-weight:bold;">TITLE</label><br><input type="text" name="title" placeholder="Net Profit" style="width:95%; padding:8px;" required></div>
-              <div><label style="font-size:11px; font-weight:bold;">ICON</label><br><input type="text" name="icon" placeholder="trending-up" style="width:95%; padding:8px;" required></div>
-              <div><label style="font-size:11px; font-weight:bold;">PREFIX</label><br><input type="text" name="prefix" placeholder="$" style="width:95%; padding:8px;"></div>
-              <div style="grid-column: span 3;"><label style="font-size:11px; font-weight:bold;">SUBTEXT</label><br><input type="text" name="subtext" placeholder="Q3 Performance" style="width:98%; padding:8px;" required></div>
-              
-              <div style="grid-column: span 3; background: white; padding: 15px; border: 1px solid #ddd; border-radius: 4px; margin-top:5px;">
-                 <label style="font-size:11px; font-weight:bold; color:#007bff;">OPTION A: Notion Data</label><br>
-                 <div style="display:flex; gap:10px; margin-bottom:10px;">
-                    <input type="text" name="dbId" placeholder="Database ID" style="flex:2; padding:8px;">
-                    <input type="text" name="property" placeholder="Property Name" style="flex:1; padding:8px;">
-                 </div>
-                 <label style="font-size:11px; font-weight:bold; color:#28a745;">OPTION B: Manual</label><br>
-                 <input type="text" name="manualValue" placeholder="0" style="width:100%; padding:8px;">
+  const cardsHtml = widgets.map(w => `
+    <div class="col-md-4 mb-4">
+      <div class="card widget-card h-100">
+        <div class="card-body">
+          <div class="row">
+            <div class="col">
+              <h5 class="card-title text-uppercase text-muted mb-0">${w.title}</h5>
+              <span class="h2 font-weight-bold mb-0 text-cookie-dark">${w.db_id ? "Live Data" : "Manual"}</span>
+            </div>
+            <div class="col-auto">
+              <div class="icon icon-shape bg-cookie text-white rounded-circle shadow">
+                <i data-feather="${w.icon}"></i>
               </div>
             </div>
-            <button type="submit" style="margin-top:15px; background:#333; color:white; padding:10px 20px; border:none; border-radius:4px; cursor:pointer;">Create Widget</button>
-          </form>
+          </div>
+          <p class="mt-3 mb-0 text-muted text-sm">
+            <span class="text-success mr-2"><i class="fa fa-arrow-up"></i> ${w.calculation || 'Sum'}</span>
+            <span class="text-nowrap">${w.subtext}</span>
+          </p>
+          <div class="mt-3">
+             <input type="text" value="${baseUrl}/embed/${w.id}" class="form-control form-control-sm mb-2" readonly onclick="this.select()">
+             <div class="d-flex justify-content-between">
+                <a href="/edit/${w.id}" class="btn btn-sm btn-outline-cookie">Edit</a>
+                <form action="/delete" method="POST" class="d-inline">
+                  <input type="hidden" name="id" value="${w.id}">
+                  <button type="submit" class="btn btn-sm btn-outline-danger">Delete</button>
+                </form>
+             </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `).join("");
+
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>Cookie Card Dashboard</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <script src="https://unpkg.com/feather-icons"></script>
+        <style>
+          :root {
+            --cookie-primary: #C69C6D;
+            --cookie-dark: #4A3B32;
+            --bg-light: #F8F9FE;
+          }
+          body { background-color: var(--bg-light); font-family: 'Open Sans', sans-serif; }
+          
+          /* Sidebar */
+          .sidebar {
+            height: 100vh;
+            position: fixed;
+            top: 0; left: 0;
+            width: 250px;
+            background: white;
+            box-shadow: 0 0 2rem 0 rgba(136, 152, 170, .15);
+            z-index: 100;
+            padding-top: 20px;
+          }
+          .sidebar .nav-link { color: #525f7f; font-weight: 600; padding: 1rem 1.5rem; display: flex; align-items: center; }
+          .sidebar .nav-link.active { color: var(--cookie-primary); background: rgba(198, 156, 109, 0.1); border-right: 4px solid var(--cookie-primary); }
+          .sidebar .nav-link i { margin-right: 10px; }
+          .brand-text { font-size: 22px; font-weight: 800; color: var(--cookie-dark); padding: 0 1.5rem; margin-bottom: 2rem; }
+          .brand-sub { font-size: 11px; color: #8898aa; text-transform: uppercase; letter-spacing: 1px; padding: 0 1.5rem; margin-top: -20px; margin-bottom: 30px; display:block;}
+          
+          /* Main Content */
+          .main-content { margin-left: 250px; padding: 30px; }
+          
+          /* Cards */
+          .widget-card { border: none; border-radius: 1rem; box-shadow: 0 0 2rem 0 rgba(136, 152, 170, .15); transition: transform 0.2s; }
+          .widget-card:hover { transform: translateY(-5px); }
+          .icon-shape { width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; border-radius: 50%; }
+          .bg-cookie { background-color: var(--cookie-primary) !important; }
+          .text-cookie-dark { color: var(--cookie-dark) !important; }
+          .btn-cookie { background-color: var(--cookie-dark); color: white; border:none; }
+          .btn-cookie:hover { background-color: var(--cookie-primary); color: white; }
+          .btn-outline-cookie { color: var(--cookie-dark); border-color: var(--cookie-dark); }
+          .btn-outline-cookie:hover { background-color: var(--cookie-dark); color: white; }
+          
+          /* Form Card */
+          .create-card { background: white; border-radius: 1rem; padding: 25px; border: 1px solid rgba(0,0,0,0.05); margin-bottom: 30px; }
+        </style>
+      </head>
+      <body>
+        <!-- Sidebar -->
+        <div class="sidebar d-none d-md-block">
+           <div class="brand-text">🍪 Cookie Card</div>
+           <span class="brand-sub">by Digital Cookie</span>
+           <ul class="nav flex-column">
+             <li class="nav-item">
+               <a class="nav-link active" href="/"><i data-feather="grid"></i> Dashboard</a>
+             </li>
+             <li class="nav-item">
+               <a class="nav-link" href="/logout"><i data-feather="log-out"></i> Logout</a>
+             </li>
+           </ul>
         </div>
 
-        <table style="width:100%; border-collapse: collapse; text-align:left;">
-          <thead><tr style="background:#f1f1f1;"><th style="padding:10px;">Widget</th><th style="padding:10px;">Embed URL</th><th style="padding:10px;">Actions</th></tr></thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>
-    </body>
+        <!-- Main -->
+        <div class="main-content">
+           <div class="d-flex justify-content-between align-items-center mb-4">
+              <h2 class="text-cookie-dark font-weight-bold">Dashboard</h2>
+              <button class="btn btn-cookie" type="button" data-bs-toggle="collapse" data-bs-target="#createForm">
+                <i data-feather="plus"></i> New Widget
+              </button>
+           </div>
+
+           <!-- Collapsible Create Form -->
+           <div class="collapse mb-4" id="createForm">
+             <div class="create-card shadow-sm">
+                <h4 class="mb-4 text-cookie-dark">Create New Widget</h4>
+                <form action="/add" method="POST">
+                  <div class="row g-3">
+                    <div class="col-md-3">
+                      <label class="form-label text-muted small fw-bold">Title</label>
+                      <input type="text" name="title" class="form-control" placeholder="Total Revenue" required>
+                    </div>
+                    <div class="col-md-2">
+                       <label class="form-label text-muted small fw-bold">Icon (Feather)</label>
+                       <input type="text" name="icon" class="form-control" placeholder="dollar-sign" required>
+                    </div>
+                    <div class="col-md-1">
+                       <label class="form-label text-muted small fw-bold">Prefix</label>
+                       <input type="text" name="prefix" class="form-control" placeholder="$">
+                    </div>
+                    <div class="col-md-6">
+                       <label class="form-label text-muted small fw-bold">Subtext</label>
+                       <input type="text" name="subtext" class="form-control" placeholder="vs last month" required>
+                    </div>
+                    
+                    <div class="col-12"><hr class="text-muted"></div>
+                    
+                    <div class="col-md-4">
+                       <label class="form-label text-primary small fw-bold">Source Database</label>
+                       <select name="dbId" id="dbSelect" class="form-select" onchange="loadProperties(this.value)">
+                          <option value="" selected>Loading...</option>
+                       </select>
+                    </div>
+                    <div class="col-md-3">
+                       <label class="form-label text-primary small fw-bold">Target Property</label>
+                       <!-- DYNAMIC PROPERTY SELECTOR -->
+                       <input type="text" name="property" id="propInput" class="form-control" placeholder="Type or Select..." list="propList">
+                       <datalist id="propList"></datalist>
+                    </div>
+                    <div class="col-md-2">
+                       <label class="form-label text-primary small fw-bold">Calculation</label>
+                       <select name="calculation" class="form-select">
+                          <option value="sum">Sum</option>
+                          <option value="average">Average</option>
+                          <option value="count">Count</option>
+                          <option value="min">Min</option>
+                          <option value="max">Max</option>
+                       </select>
+                    </div>
+                    <div class="col-md-3">
+                       <label class="form-label text-success small fw-bold">Or Manual Value</label>
+                       <input type="text" name="manualValue" class="form-control" placeholder="0">
+                    </div>
+                  </div>
+                  <div class="mt-4 text-end">
+                     <button type="button" class="btn btn-light" data-bs-toggle="collapse" data-bs-target="#createForm">Cancel</button>
+                     <button type="submit" class="btn btn-cookie px-4">Create Widget</button>
+                  </div>
+                </form>
+             </div>
+           </div>
+
+           <!-- Widget Grid -->
+           <div class="row">
+              ${cardsHtml}
+           </div>
+           
+           ${widgets.length === 0 ? '<div class="text-center text-muted mt-5"><p>No widgets yet. Click "New Widget" to start.</p></div>' : ''}
+        </div>
+
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+        <script>
+          feather.replace();
+
+          // Load Databases on Load
+          async function loadDatabases() {
+            const select = document.getElementById('dbSelect');
+            try {
+              const res = await fetch('/api/databases');
+              const dbs = await res.json();
+              select.innerHTML = '<option value="">-- Select Database --</option>';
+              dbs.forEach(db => {
+                const option = document.createElement('option');
+                option.value = db.id;
+                option.innerText = db.icon + " " + db.title;
+                select.appendChild(option);
+              });
+            } catch (e) { select.innerHTML = '<option>Error loading</option>'; }
+          }
+
+          // Load Properties when DB selected
+          async function loadProperties(dbId) {
+             const list = document.getElementById('propList');
+             const input = document.getElementById('propInput');
+             list.innerHTML = '';
+             input.value = ''; 
+             
+             if(!dbId) return;
+
+             try {
+               const res = await fetch('/api/properties?dbId=' + dbId);
+               const props = await res.json();
+               props.forEach(p => {
+                 const opt = document.createElement('option');
+                 opt.value = p;
+                 list.appendChild(opt);
+               });
+             } catch(e) { console.log("Error fetching properties"); }
+          }
+
+          loadDatabases();
+        </script>
+      </body>
+    </html>
   `);
 });
 
-// --- ROUTES: EDIT (PROTECTED) ---
+// --- UI: EDIT PAGE ---
 app.get("/edit/:id", requireAuth, async (req, res) => {
   const result = await pool.query("SELECT * FROM widgets WHERE id = $1 AND user_id = $2", [req.params.id, req.session.userId]);
   const w = result.rows[0];
-  if (!w) return res.send("Widget not found or access denied.");
+  if (!w) return res.send("Widget not found.");
+  
+  const isSel = (val) => (w.calculation === val ? 'selected' : '');
 
   res.send(`
-    <body style="font-family: sans-serif; padding: 40px; max-width: 700px; margin: 0 auto; background: #f9f9f9;">
-      <div style="background: white; padding: 30px; border-radius: 8px;">
-        <h2>✏️ Edit Widget</h2>
-        <form action="/update" method="POST">
-          <input type="hidden" name="id" value="${w.id}">
-          <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 15px;">
-            <div><label style="font-size:11px; font-weight:bold;">TITLE</label><br><input type="text" name="title" value="${w.title}" style="width:95%; padding:8px;" required></div>
-            <div><label style="font-size:11px; font-weight:bold;">ICON</label><br><input type="text" name="icon" value="${w.icon}" style="width:95%; padding:8px;" required></div>
-            <div><label style="font-size:11px; font-weight:bold;">PREFIX</label><br><input type="text" name="prefix" value="${w.prefix||''}" style="width:95%; padding:8px;"></div>
-            <div><label style="font-size:11px; font-weight:bold;">SUBTEXT</label><br><input type="text" name="subtext" value="${w.subtext}" style="width:95%; padding:8px;" required></div>
-          </div>
-          <br>
-          <div style="background:#f4f4f4; padding:15px;">
-             <input type="text" name="dbId" value="${w.db_id||''}" placeholder="DB ID" style="width:60%; padding:8px;">
-             <input type="text" name="property" value="${w.property||''}" placeholder="Property" style="width:30%; padding:8px;">
-             <br><br>
-             <input type="text" name="manualValue" value="${w.manual_value||''}" placeholder="Manual Value" style="width:100%; padding:8px;">
-          </div>
-          <br>
-          <button type="submit" style="background:#007bff; color:white; padding:10px 25px; border:none; cursor:pointer;">Save</button>
-        </form>
-      </div>
-    </body>
+    <html>
+      <head>
+        <title>Edit Widget</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <style>
+           body { background: #F8F9FE; font-family: sans-serif; padding: 40px; }
+           .edit-card { background: white; border-radius: 1rem; max-width: 800px; margin: 0 auto; padding: 40px; box-shadow: 0 0 20px rgba(0,0,0,0.05); }
+           .btn-cookie { background-color: #4A3B32; color: white; }
+           .btn-cookie:hover { background-color: #C69C6D; color: white; }
+        </style>
+      </head>
+      <body>
+         <div class="edit-card">
+            <h3 class="mb-4 text-center" style="color:#4A3B32;">Edit Widget</h3>
+            <form action="/update" method="POST">
+               <input type="hidden" name="id" value="${w.id}">
+               
+               <div class="row g-3">
+                  <div class="col-md-6">
+                    <label class="form-label fw-bold small">Title</label>
+                    <input type="text" name="title" class="form-control" value="${w.title}" required>
+                  </div>
+                  <div class="col-md-3">
+                     <label class="form-label fw-bold small">Icon</label>
+                     <input type="text" name="icon" class="form-control" value="${w.icon}" required>
+                  </div>
+                  <div class="col-md-3">
+                     <label class="form-label fw-bold small">Prefix</label>
+                     <input type="text" name="prefix" class="form-control" value="${w.prefix||''}">
+                  </div>
+                  <div class="col-12">
+                     <label class="form-label fw-bold small">Subtext</label>
+                     <input type="text" name="subtext" class="form-control" value="${w.subtext}" required>
+                  </div>
+
+                  <div class="col-12"><hr></div>
+                  
+                  <div class="col-md-6">
+                     <label class="form-label text-primary fw-bold small">Database</label>
+                     <select name="dbId" id="dbSelect" class="form-select" data-selected="${w.db_id||''}" onchange="loadProperties(this.value)">
+                        <option value="">Loading...</option>
+                     </select>
+                  </div>
+                  <div class="col-md-6">
+                     <label class="form-label text-primary fw-bold small">Property</label>
+                     <input type="text" name="property" id="propInput" class="form-control" value="${w.property||''}" list="propList">
+                     <datalist id="propList"></datalist>
+                  </div>
+                  
+                  <div class="col-md-6">
+                     <label class="form-label text-primary fw-bold small">Calculation</label>
+                     <select name="calculation" class="form-select">
+                        <option value="sum" ${isSel('sum')}>Sum</option>
+                        <option value="average" ${isSel('average')}>Average</option>
+                        <option value="count" ${isSel('count')}>Count</option>
+                        <option value="min" ${isSel('min')}>Min</option>
+                        <option value="max" ${isSel('max')}>Max</option>
+                     </select>
+                  </div>
+                  <div class="col-md-6">
+                     <label class="form-label text-success fw-bold small">Manual Value (Override)</label>
+                     <input type="text" name="manualValue" class="form-control" value="${w.manual_value||''}">
+                  </div>
+               </div>
+
+               <div class="mt-4 d-flex justify-content-between">
+                  <a href="/" class="btn btn-outline-secondary">Cancel</a>
+                  <button type="submit" class="btn btn-cookie px-5">Save Changes</button>
+               </div>
+            </form>
+         </div>
+         
+         <script>
+           async function loadDatabases() {
+              const select = document.getElementById('dbSelect');
+              const currentId = select.getAttribute('data-selected');
+              try {
+                const res = await fetch('/api/databases');
+                const dbs = await res.json();
+                select.innerHTML = '<option value="">-- Select --</option>';
+                dbs.forEach(db => {
+                  const opt = document.createElement('option');
+                  opt.value = db.id;
+                  opt.innerText = db.icon + " " + db.title;
+                  if(db.id === currentId) opt.selected = true;
+                  select.appendChild(opt);
+                });
+                
+                // If DB is selected, load properties
+                if(currentId) loadProperties(currentId);
+                
+              } catch(e) {}
+           }
+           
+           async function loadProperties(dbId) {
+             const list = document.getElementById('propList');
+             list.innerHTML = '';
+             if(!dbId) return;
+             try {
+               const res = await fetch('/api/properties?dbId=' + dbId);
+               const props = await res.json();
+               props.forEach(p => {
+                 const opt = document.createElement('option');
+                 opt.value = p;
+                 list.appendChild(opt);
+               });
+             } catch(e) {}
+           }
+           loadDatabases();
+         </script>
+      </body>
+    </html>
   `);
 });
 
-// --- API ACTIONS (PROTECTED) ---
+// --- ACTIONS ---
 app.post("/add", requireAuth, async (req, res) => {
-  const { title, icon, prefix, subtext, dbId, property, manualValue } = req.body;
+  const { title, icon, prefix, subtext, dbId, property, manualValue, calculation } = req.body;
   const id = uuidv4();
   await pool.query(
-    `INSERT INTO widgets (id, user_id, title, icon, prefix, subtext, db_id, property, manual_value)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-    [id, req.session.userId, title, icon, prefix, subtext, dbId || null, property || null, manualValue || "0"]
+    `INSERT INTO widgets (id, user_id, title, icon, prefix, subtext, db_id, property, manual_value, calculation)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [id, req.session.userId, title, icon, prefix, subtext, dbId || null, property || null, manualValue || "0", calculation || "sum"]
   );
   res.redirect("/");
 });
 
 app.post("/update", requireAuth, async (req, res) => {
-  const { id, title, icon, prefix, subtext, dbId, property, manualValue } = req.body;
+  const { id, title, icon, prefix, subtext, dbId, property, manualValue, calculation } = req.body;
   await pool.query(
-    `UPDATE widgets SET title=$1, icon=$2, prefix=$3, subtext=$4, db_id=$5, property=$6, manual_value=$7 
-     WHERE id=$8 AND user_id=$9`,
-    [title, icon, prefix, subtext, dbId || null, property || null, manualValue || "0", id, req.session.userId]
+    `UPDATE widgets SET title=$1, icon=$2, prefix=$3, subtext=$4, db_id=$5, property=$6, manual_value=$7, calculation=$8 
+     WHERE id=$9 AND user_id=$10`,
+    [title, icon, prefix, subtext, dbId || null, property || null, manualValue || "0", calculation || "sum", id, req.session.userId]
   );
   res.redirect("/");
 });
@@ -326,31 +646,22 @@ app.post("/delete", requireAuth, async (req, res) => {
   res.redirect("/");
 });
 
-
-// --- PUBLIC EMBED ROUTE (NO AUTH REQUIRED) ---
-// This is the "Magic" part. The viewer doesn't need to login.
-// The code uses the Widget ID to find the User, then uses THAT User's token.
+// --- PUBLIC EMBED ---
 app.get("/embed/:id", async (req, res) => {
-  // 1. Get Widget
   const wRes = await pool.query("SELECT * FROM widgets WHERE id = $1", [req.params.id]);
   const widget = wRes.rows[0];
-
   if (!widget) return res.send("Widget not found");
 
-  // 2. Get the Owner's Token
   const uRes = await pool.query("SELECT access_token FROM users WHERE id = $1", [widget.user_id]);
   const user = uRes.rows[0];
-
   if (!user) return res.send("Owner not found");
 
-  // 3. Fetch Data using Owner's Token
   let finalNumber = widget.manual_value;
   if (widget.db_id) {
-    const sum = await getNotionSum(user.access_token, widget.db_id, widget.property);
-    if (sum !== null) finalNumber = sum;
+    const agg = await getNotionAggregatedValue(user.access_token, widget.db_id, widget.property, widget.calculation);
+    if (agg !== null) finalNumber = agg;
   }
 
-  // 4. Render
   let displayString = finalNumber;
   if (!isNaN(finalNumber)) {
      const num = parseFloat(finalNumber);
