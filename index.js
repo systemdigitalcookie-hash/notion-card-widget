@@ -164,38 +164,56 @@ app.get('/api/databases', requireAuth, async (req, res) => {
   }
 });
 
-// --- API: GET PROPERTIES (New Feature) ---
-app.get('/api/properties', requireAuth, async (req, res) => {
+// --- DEBUG ROUTE: LIST DATABASES ---
+app.get('/api/databases', requireAuth, async (req, res) => {
+  console.log("1. Starting Database Search request..."); // LOG 1
   try {
-    const { dbId } = req.query;
-    if(!dbId) return res.json([]);
-
+    // 1. Get User Token
+    console.log(`2. Looking for user: ${req.session.userId}`); // LOG 2
     const uRes = await pool.query("SELECT access_token FROM users WHERE id = $1", [req.session.userId]);
     const user = uRes.rows[0];
+    
+    if (!user) {
+      console.log("❌ User not found in DB");
+      return res.status(401).json({ error: "User not found" });
+    }
+    console.log("3. User found. Token length: " + (user.access_token ? user.access_token.length : "0")); // LOG 3
 
-    // Fetch Database Schema
-    const response = await axios.get(`https://api.notion.com/v1/databases/${dbId}`, {
-      headers: {
-        'Authorization': `Bearer ${user.access_token}`,
-        'Notion-Version': NOTION_VERSION,
+    // 2. Search Notion for Databases
+    console.log("4. Sending request to Notion API..."); // LOG 4
+    const response = await axios.post('https://api.notion.com/v1/search', 
+      {
+        filter: { value: 'database', property: 'object' },
+        sort: { direction: 'descending', timestamp: 'last_edited_time' }
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${user.access_token}`,
+          'Notion-Version': NOTION_VERSION,
+          'Content-Type': 'application/json'
+        }
       }
-    });
+    );
 
-    // Extract Number and Formula properties
-    const properties = response.data.properties;
-    const validProps = Object.keys(properties).filter(key => {
-      const type = properties[key].type;
-      // We accept Numbers or Formulas (assuming formula is number type, which we can't fully know without checking, but we list all formulas)
-      return type === 'number' || type === 'formula';
-    });
+    console.log(`5. Notion responded. Found ${response.data.results.length} items.`); // LOG 5
 
-    res.json(validProps);
+    // 3. Format Results
+    const databases = response.data.results.map(db => ({
+      id: db.id,
+      title: db.title && db.title.length > 0 ? db.title[0].plain_text : "Untitled Database",
+      icon: db.icon ? (db.icon.emoji || "📄") : "📄"
+    }));
+
+    res.json(databases);
   } catch (error) {
-    console.error(error);
-    res.json([]);
+    // LOG THE ACTUAL ERROR DETAILED
+    console.error("❌ CRITICAL SEARCH ERROR:", error.message);
+    if (error.response) {
+      console.error("Notion API Error Data:", JSON.stringify(error.response.data));
+    }
+    res.status(500).json({ error: "Failed to fetch databases" });
   }
 });
-
 
 // --- UI: LOGIN ---
 app.get('/login', (req, res) => {
