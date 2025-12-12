@@ -19,7 +19,6 @@ app.use(cookieSession({
 const NOTION_CLIENT_ID = process.env.NOTION_CLIENT_ID;
 const NOTION_CLIENT_SECRET = process.env.NOTION_CLIENT_SECRET;
 const NOTION_REDIRECT_URI = process.env.NOTION_REDIRECT_URI;
-// Using the stable 2022 version to ensure reliability
 const NOTION_VERSION = "2022-06-28"; 
 const DEFAULT_PROPERTY = "WidgetValue"; 
 
@@ -40,7 +39,6 @@ async function initDB() {
         bot_id TEXT
       );
     `);
-    // Removed 'icon' and 'manual_value' from definition for new tables
     await pool.query(`
       CREATE TABLE IF NOT EXISTS widgets (
         id TEXT PRIMARY KEY,
@@ -156,14 +154,11 @@ app.get('/api/databases', requireAuth, async (req, res) => {
     res.json(databases);
   } catch (error) {
     console.error("❌ SEARCH ERROR:", error.message);
-    if (error.response) {
-      console.error("Notion API Error Data:", JSON.stringify(error.response.data));
-    }
     res.status(500).json({ error: "Failed to fetch databases" });
   }
 });
 
-// --- API: GET DATABASE PROPERTIES (New Feature) ---
+// --- API: GET DATABASE PROPERTIES ---
 app.get('/api/properties', requireAuth, async (req, res) => {
   const { dbId } = req.query;
   if (!dbId) return res.status(400).json({ error: "Missing dbId" });
@@ -209,7 +204,6 @@ app.get('/login', (req, res) => {
           body { background-color: #F8F9FE; height: 100vh; display: flex; align-items: center; justify-content: center; }
           .login-card { background: white; border-radius: 15px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); padding: 40px; text-align: center; max-width: 400px; width: 100%; border-top: 5px solid #C69C6D; }
           .btn-cookie { background-color: #4A3B32; color: #fff; border: none; padding: 10px 20px; border-radius: 5px; font-weight: 600; width: 100%; transition: all 0.2s; }
-          .btn-cookie:hover { background-color: #C69C6D; color: white; transform: translateY(-2px); }
           .logo-text { font-weight: 800; color: #4A3B32; font-size: 24px; margin-bottom: 5px; }
           .sub-text { color: #8898aa; font-size: 14px; margin-bottom: 30px; }
         </style>
@@ -402,8 +396,9 @@ app.get("/", requireAuth, async (req, res) => {
                     </div>
                     <div class="col-md-4">
                        <label class="form-label text-primary small fw-bold">Target Property</label>
-                       <input type="text" name="property" id="propInput" class="form-control" placeholder="Type or Select..." list="propList">
-                       <datalist id="propList"></datalist>
+                       <select name="property" id="propSelect" class="form-select" disabled>
+                          <option value="" selected>Select Database First</option>
+                       </select>
                     </div>
                     <div class="col-md-2">
                        <label class="form-label text-primary small fw-bold">Calculation</label>
@@ -451,22 +446,36 @@ app.get("/", requireAuth, async (req, res) => {
           }
 
           async function loadProperties(dbId) {
-             const list = document.getElementById('propList');
-             const input = document.getElementById('propInput');
-             list.innerHTML = '';
-             input.value = ''; 
+             const select = document.getElementById('propSelect');
+             select.innerHTML = '<option value="">Loading...</option>';
+             select.disabled = true;
              
-             if(!dbId) return;
+             if(!dbId) {
+                select.innerHTML = '<option value="">Select Database First</option>';
+                return;
+             }
 
              try {
-               const res = await fetch('/api/properties?dbId=' + dbId);
-               const props = await res.json();
+               constQXres = await fetch('/api/properties?dbId=' + dbId);
+               const props = awaitQXres.json();
+               
+               if (props.length === 0) {
+                   select.innerHTML = '<option value="">No Number Properties Found</option>';
+                   return;
+               }
+
+               select.innerHTML = '<option value="">-- Select Property --</option>';
                props.forEach(p => {
                  const opt = document.createElement('option');
                  opt.value = p;
-                 list.appendChild(opt);
+                 opt.innerText = p;
+                 select.appendChild(opt);
                });
-             } catch(e) { console.log("Error fetching properties"); }
+               select.disabled = false;
+             } catch(e) { 
+                 console.log("Error fetching properties"); 
+                 select.innerHTML = '<option>Error</option>';
+             }
           }
 
           loadDatabases();
@@ -526,8 +535,9 @@ app.get("/edit/:id", requireAuth, async (req, res) => {
                   </div>
                   <div class="col-md-6">
                      <label class="form-label text-primary fw-bold small">Property</label>
-                     <input type="text" name="property" id="propInput" class="form-control" value="${w.property||''}" list="propList">
-                     <datalist id="propList"></datalist>
+                     <select name="property" id="propSelect" class="form-select" data-selected="${w.property||''}">
+                        <option value="">Loading...</option>
+                     </select>
                   </div>
                   
                   <div class="col-12">
@@ -571,17 +581,27 @@ app.get("/edit/:id", requireAuth, async (req, res) => {
            }
            
            async function loadProperties(dbId) {
-             const list = document.getElementById('propList');
-             list.innerHTML = '';
+             const select = document.getElementById('propSelect');
+             const currentProp = select.getAttribute('data-selected');
+             
+             select.innerHTML = '<option value="">Loading...</option>';
+             select.disabled = true;
+             
              if(!dbId) return;
+
              try {
                const res = await fetch('/api/properties?dbId=' + dbId);
                const props = await res.json();
+               
+               select.innerHTML = '<option value="">-- Select Property --</option>';
                props.forEach(p => {
                  const opt = document.createElement('option');
                  opt.value = p;
-                 list.appendChild(opt);
+                 opt.innerText = p;
+                 if(p === currentProp) opt.selected = true;
+                 select.appendChild(opt);
                });
+               select.disabled = false;
              } catch(e) {}
            }
            loadDatabases();
