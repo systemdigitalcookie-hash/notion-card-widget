@@ -19,7 +19,8 @@ app.use(cookieSession({
 const NOTION_CLIENT_ID = process.env.NOTION_CLIENT_ID;
 const NOTION_CLIENT_SECRET = process.env.NOTION_CLIENT_SECRET;
 const NOTION_REDIRECT_URI = process.env.NOTION_REDIRECT_URI;
-const NOTION_VERSION = "2025-09-03"; 
+// Using the stable 2022 version to ensure reliability
+const NOTION_VERSION = "2022-06-28"; 
 const DEFAULT_PROPERTY = "WidgetValue"; 
 
 // --- DATABASE CONNECTION ---
@@ -39,17 +40,16 @@ async function initDB() {
         bot_id TEXT
       );
     `);
+    // Removed 'icon' and 'manual_value' from definition for new tables
     await pool.query(`
       CREATE TABLE IF NOT EXISTS widgets (
         id TEXT PRIMARY KEY,
         user_id TEXT,
         title TEXT,
-        icon TEXT,
         prefix TEXT,
         subtext TEXT,
         db_id TEXT,
         property TEXT,
-        manual_value TEXT,
         calculation TEXT 
       );
     `);
@@ -81,39 +81,30 @@ async function getNotionAggregatedValue(accessToken, databaseId, propertyName, c
       "Content-Type": "application/json",
     };
 
-    let dataSources = [];
-    try {
-      const dbResponse = await axios.get(
-        `https://api.notion.com/v1/databases/${databaseId}`,
-        { headers }
-      );
-      if (dbResponse.data.data_sources) dataSources = dbResponse.data.data_sources;
-      else dataSources = [{ id: databaseId }];
-    } catch (e) {
-      console.error("Meta Error:", e.response?.data || e.message);
-      return null;
-    }
-
     let values = [];
     
-    for (const source of dataSources) {
-      try {
-        const queryUrl = `https://api.notion.com/v1/data_sources/${source.id}/query`;
-        const response = await axios.post(queryUrl, { page_size: 100 }, { headers });
+    try {
+      const queryUrl = `https://api.notion.com/v1/databases/${databaseId}/query`;
+      const response = await axios.post(queryUrl, { page_size: 100 }, { headers });
 
-        for (const page of response.data.results) {
-          const prop = page.properties[targetProp];
-          let num = null;
-          if (prop) {
-            if (prop.type === "formula" && prop.formula.type === "number") {
-              num = prop.formula.number;
-            } else if (prop.type === "number") {
-              num = prop.number;
-            }
-          }
-          if (num !== null) values.push(num);
+      for (const page of response.data.results) {
+        if (!page.properties || !page.properties[targetProp]) continue;
+
+        const prop = page.properties[targetProp];
+        let num = null;
+
+        if (prop.type === "formula" && prop.formula.type === "number") {
+          num = prop.formula.number;
+        } else if (prop.type === "number") {
+          num = prop.number;
+        } else if (prop.type === "rollup" && prop.rollup.type === "number") {
+          num = prop.rollup.number;
         }
-      } catch (innerError) { /* ignore */ }
+
+        if (num !== null) values.push(num);
+      }
+    } catch (innerError) {
+      console.error("Aggregation Query Error:", innerError.response?.data || innerError.message);
     }
 
     if (values.length === 0) return 0;
@@ -126,33 +117,27 @@ async function getNotionAggregatedValue(accessToken, databaseId, propertyName, c
     
     return 0;
   } catch (error) {
-    console.error("Critical Error:", error.message);
+    console.error("Critical Aggregation Error:", error.message);
     return null;
   }
 }
 
-// --- DEBUG ROUTE: LIST DATABASES ---
+// --- API: LIST DATABASES ---
 app.get('/api/databases', requireAuth, async (req, res) => {
-  console.log("1. Starting Database Search request..."); // LOG 1
+  console.log("1. Starting Database Search request...");
   try {
-    // 1. Get User Token
-    console.log(`2. Looking for user: ${req.session.userId}`); // LOG 2
     const uRes = await pool.query("SELECT access_token FROM users WHERE id = $1", [req.session.userId]);
     const user = uRes.rows[0];
     
     if (!user) {
-      console.log("❌ User not found in DB");
       return res.status(401).json({ error: "User not found" });
     }
-    console.log("3. User found. Token length: " + (user.access_token ? user.access_token.length : "0")); // LOG 3
 
-    // 2. Search Notion for Databases
-    console.log("4. Sending request to Notion API..."); // LOG 4
     const response = await axios.post('https://api.notion.com/v1/search', 
-    {
-      filter: { value: 'data_source', property: 'object' }, // <--- UPDATED FOR 2025 API
-      sort: { direction: 'descending', timestamp: 'last_edited_time' }
-    },
+      {
+        filter: { value: 'database', property: 'object' },
+        sort: { direction: 'descending', timestamp: 'last_edited_time' }
+      },
       {
         headers: {
           'Authorization': `Bearer ${user.access_token}`,
@@ -162,9 +147,6 @@ app.get('/api/databases', requireAuth, async (req, res) => {
       }
     );
 
-    console.log(`5. Notion responded. Found ${response.data.results.length} items.`); // LOG 5
-
-    // 3. Format Results
     const databases = response.data.results.map(db => ({
       id: db.id,
       title: db.title && db.title.length > 0 ? db.title[0].plain_text : "Untitled Database",
@@ -173,12 +155,46 @@ app.get('/api/databases', requireAuth, async (req, res) => {
 
     res.json(databases);
   } catch (error) {
-    // LOG THE ACTUAL ERROR DETAILED
-    console.error("❌ CRITICAL SEARCH ERROR:", error.message);
+    console.error("❌ SEARCH ERROR:", error.message);
     if (error.response) {
       console.error("Notion API Error Data:", JSON.stringify(error.response.data));
     }
     res.status(500).json({ error: "Failed to fetch databases" });
+  }
+});
+
+// --- API: GET DATABASE PROPERTIES (New Feature) ---
+app.get('/api/properties', requireAuth, async (req, res) => {
+  const { dbId } = req.query;
+  if (!dbId) return res.status(400).json({ error: "Missing dbId" });
+
+  try {
+    const uRes = await pool.query("SELECT access_token FROM users WHERE id = $1", [req.session.userId]);
+    const user = uRes.rows[0];
+    if (!user) return res.status(401).json({ error: "User not found" });
+
+    const response = await axios.get(`https://api.notion.com/v1/databases/${dbId}`, {
+      headers: {
+        'Authorization': `Bearer ${user.access_token}`,
+        'Notion-Version': NOTION_VERSION,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const properties = response.data.properties;
+    const validProps = [];
+
+    // Filter for Number, Formula, and Rollup
+    for (const [key, prop] of Object.entries(properties)) {
+       if (prop.type === 'number' || prop.type === 'formula' || prop.type === 'rollup') {
+         validProps.push(key);
+       }
+    }
+
+    res.json(validProps);
+  } catch (error) {
+    console.error("Property Fetch Error:", error.response?.data || error.message);
+    res.status(500).json({ error: "Failed to fetch properties" });
   }
 });
 
@@ -241,6 +257,7 @@ app.get('/auth/notion/callback', async (req, res) => {
     req.session.userId = userId;
     res.redirect('/');
   } catch (error) {
+    console.error("Login Callback Error:", error.message);
     res.send("Error logging in.");
   }
 });
@@ -250,7 +267,7 @@ app.get('/logout', (req, res) => {
   res.redirect('/login');
 });
 
-// --- UI: DASHBOARD (Argon/Cookie Style) ---
+// --- UI: DASHBOARD ---
 app.get("/", requireAuth, async (req, res) => {
   const userId = req.session.userId;
   const result = await pool.query("SELECT * FROM widgets WHERE user_id = $1", [userId]);
@@ -264,16 +281,11 @@ app.get("/", requireAuth, async (req, res) => {
           <div class="row">
             <div class="col">
               <h5 class="card-title text-uppercase text-muted mb-0">${w.title}</h5>
-              <span class="h2 font-weight-bold mb-0 text-cookie-dark">${w.db_id ? "Live Data" : "Manual"}</span>
-            </div>
-            <div class="col-auto">
-              <div class="icon icon-shape bg-cookie text-white rounded-circle shadow">
-                <i data-feather="${w.icon}"></i>
-              </div>
+              <span class="h2 font-weight-bold mb-0 text-cookie-dark">${w.db_id ? "Live Data" : "Setup Needed"}</span>
             </div>
           </div>
           <p class="mt-3 mb-0 text-muted text-sm">
-            <span class="text-success mr-2"><i class="fa fa-arrow-up"></i> ${w.calculation || 'Sum'}</span>
+            <span class="text-success mr-2"> ${w.calculation || 'Sum'}</span>
             <span class="text-nowrap">${w.subtext}</span>
           </p>
           <div class="mt-3">
@@ -329,7 +341,6 @@ app.get("/", requireAuth, async (req, res) => {
           /* Cards */
           .widget-card { border: none; border-radius: 1rem; box-shadow: 0 0 2rem 0 rgba(136, 152, 170, .15); transition: transform 0.2s; }
           .widget-card:hover { transform: translateY(-5px); }
-          .icon-shape { width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; border-radius: 50%; }
           .bg-cookie { background-color: var(--cookie-primary) !important; }
           .text-cookie-dark { color: var(--cookie-dark) !important; }
           .btn-cookie { background-color: var(--cookie-dark); color: white; border:none; }
@@ -342,7 +353,6 @@ app.get("/", requireAuth, async (req, res) => {
         </style>
       </head>
       <body>
-        <!-- Sidebar -->
         <div class="sidebar d-none d-md-block">
            <div class="brand-text">🍪 Cookie Card</div>
            <span class="brand-sub">by Digital Cookie</span>
@@ -356,7 +366,6 @@ app.get("/", requireAuth, async (req, res) => {
            </ul>
         </div>
 
-        <!-- Main -->
         <div class="main-content">
            <div class="d-flex justify-content-between align-items-center mb-4">
               <h2 class="text-cookie-dark font-weight-bold">Dashboard</h2>
@@ -365,21 +374,16 @@ app.get("/", requireAuth, async (req, res) => {
               </button>
            </div>
 
-           <!-- Collapsible Create Form -->
            <div class="collapse mb-4" id="createForm">
              <div class="create-card shadow-sm">
                 <h4 class="mb-4 text-cookie-dark">Create New Widget</h4>
                 <form action="/add" method="POST">
                   <div class="row g-3">
-                    <div class="col-md-3">
+                    <div class="col-md-4">
                       <label class="form-label text-muted small fw-bold">Title</label>
                       <input type="text" name="title" class="form-control" placeholder="Total Revenue" required>
                     </div>
                     <div class="col-md-2">
-                       <label class="form-label text-muted small fw-bold">Icon (Feather)</label>
-                       <input type="text" name="icon" class="form-control" placeholder="dollar-sign" required>
-                    </div>
-                    <div class="col-md-1">
                        <label class="form-label text-muted small fw-bold">Prefix</label>
                        <input type="text" name="prefix" class="form-control" placeholder="$">
                     </div>
@@ -390,15 +394,14 @@ app.get("/", requireAuth, async (req, res) => {
                     
                     <div class="col-12"><hr class="text-muted"></div>
                     
-                    <div class="col-md-4">
+                    <div class="col-md-6">
                        <label class="form-label text-primary small fw-bold">Source Database</label>
                        <select name="dbId" id="dbSelect" class="form-select" onchange="loadProperties(this.value)">
                           <option value="" selected>Loading...</option>
                        </select>
                     </div>
-                    <div class="col-md-3">
+                    <div class="col-md-4">
                        <label class="form-label text-primary small fw-bold">Target Property</label>
-                       <!-- DYNAMIC PROPERTY SELECTOR -->
                        <input type="text" name="property" id="propInput" class="form-control" placeholder="Type or Select..." list="propList">
                        <datalist id="propList"></datalist>
                     </div>
@@ -412,10 +415,6 @@ app.get("/", requireAuth, async (req, res) => {
                           <option value="max">Max</option>
                        </select>
                     </div>
-                    <div class="col-md-3">
-                       <label class="form-label text-success small fw-bold">Or Manual Value</label>
-                       <input type="text" name="manualValue" class="form-control" placeholder="0">
-                    </div>
                   </div>
                   <div class="mt-4 text-end">
                      <button type="button" class="btn btn-light" data-bs-toggle="collapse" data-bs-target="#createForm">Cancel</button>
@@ -425,7 +424,6 @@ app.get("/", requireAuth, async (req, res) => {
              </div>
            </div>
 
-           <!-- Widget Grid -->
            <div class="row">
               ${cardsHtml}
            </div>
@@ -437,7 +435,6 @@ app.get("/", requireAuth, async (req, res) => {
         <script>
           feather.replace();
 
-          // Load Databases on Load
           async function loadDatabases() {
             const select = document.getElementById('dbSelect');
             try {
@@ -453,7 +450,6 @@ app.get("/", requireAuth, async (req, res) => {
             } catch (e) { select.innerHTML = '<option>Error loading</option>'; }
           }
 
-          // Load Properties when DB selected
           async function loadProperties(dbId) {
              const list = document.getElementById('propList');
              const input = document.getElementById('propInput');
@@ -511,11 +507,7 @@ app.get("/edit/:id", requireAuth, async (req, res) => {
                     <label class="form-label fw-bold small">Title</label>
                     <input type="text" name="title" class="form-control" value="${w.title}" required>
                   </div>
-                  <div class="col-md-3">
-                     <label class="form-label fw-bold small">Icon</label>
-                     <input type="text" name="icon" class="form-control" value="${w.icon}" required>
-                  </div>
-                  <div class="col-md-3">
+                  <div class="col-md-6">
                      <label class="form-label fw-bold small">Prefix</label>
                      <input type="text" name="prefix" class="form-control" value="${w.prefix||''}">
                   </div>
@@ -538,7 +530,7 @@ app.get("/edit/:id", requireAuth, async (req, res) => {
                      <datalist id="propList"></datalist>
                   </div>
                   
-                  <div class="col-md-6">
+                  <div class="col-12">
                      <label class="form-label text-primary fw-bold small">Calculation</label>
                      <select name="calculation" class="form-select">
                         <option value="sum" ${isSel('sum')}>Sum</option>
@@ -547,10 +539,6 @@ app.get("/edit/:id", requireAuth, async (req, res) => {
                         <option value="min" ${isSel('min')}>Min</option>
                         <option value="max" ${isSel('max')}>Max</option>
                      </select>
-                  </div>
-                  <div class="col-md-6">
-                     <label class="form-label text-success fw-bold small">Manual Value (Override)</label>
-                     <input type="text" name="manualValue" class="form-control" value="${w.manual_value||''}">
                   </div>
                </div>
 
@@ -577,7 +565,6 @@ app.get("/edit/:id", requireAuth, async (req, res) => {
                   select.appendChild(opt);
                 });
                 
-                // If DB is selected, load properties
                 if(currentId) loadProperties(currentId);
                 
               } catch(e) {}
@@ -606,22 +593,22 @@ app.get("/edit/:id", requireAuth, async (req, res) => {
 
 // --- ACTIONS ---
 app.post("/add", requireAuth, async (req, res) => {
-  const { title, icon, prefix, subtext, dbId, property, manualValue, calculation } = req.body;
+  const { title, prefix, subtext, dbId, property, calculation } = req.body;
   const id = uuidv4();
   await pool.query(
-    `INSERT INTO widgets (id, user_id, title, icon, prefix, subtext, db_id, property, manual_value, calculation)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-    [id, req.session.userId, title, icon, prefix, subtext, dbId || null, property || null, manualValue || "0", calculation || "sum"]
+    `INSERT INTO widgets (id, user_id, title, prefix, subtext, db_id, property, calculation)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [id, req.session.userId, title, prefix, subtext, dbId || null, property || null, calculation || "sum"]
   );
   res.redirect("/");
 });
 
 app.post("/update", requireAuth, async (req, res) => {
-  const { id, title, icon, prefix, subtext, dbId, property, manualValue, calculation } = req.body;
+  const { id, title, prefix, subtext, dbId, property, calculation } = req.body;
   await pool.query(
-    `UPDATE widgets SET title=$1, icon=$2, prefix=$3, subtext=$4, db_id=$5, property=$6, manual_value=$7, calculation=$8 
-     WHERE id=$9 AND user_id=$10`,
-    [title, icon, prefix, subtext, dbId || null, property || null, manualValue || "0", calculation || "sum", id, req.session.userId]
+    `UPDATE widgets SET title=$1, prefix=$2, subtext=$3, db_id=$4, property=$5, calculation=$6 
+     WHERE id=$7 AND user_id=$8`,
+    [title, prefix, subtext, dbId || null, property || null, calculation || "sum", id, req.session.userId]
   );
   res.redirect("/");
 });
@@ -641,7 +628,7 @@ app.get("/embed/:id", async (req, res) => {
   const user = uRes.rows[0];
   if (!user) return res.send("Owner not found");
 
-  let finalNumber = widget.manual_value;
+  let finalNumber = 0;
   if (widget.db_id) {
     const agg = await getNotionAggregatedValue(user.access_token, widget.db_id, widget.property, widget.calculation);
     if (agg !== null) finalNumber = agg;
@@ -660,29 +647,22 @@ app.get("/embed/:id", async (req, res) => {
       <head>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta http-equiv="refresh" content="300"> 
-        <script src="https://unpkg.com/feather-icons"></script>
         <style>
-          :root { --card-bg: #FFFFFF; --card-border: #E0E0E0; --text-title: #787774; --text-value: #37352F; --text-sub: #9B9A97; --icon-color: #9B9A97; }
-          @media (prefers-color-scheme: dark) { :root { --card-bg: #202020; --card-border: #333333; --text-title: #AFAFAF; --text-value: #FFFFFF; --text-sub: #808080; --icon-color: #808080; } }
+          :root { --card-bg: #FFFFFF; --card-border: #E0E0E0; --text-title: #787774; --text-value: #37352F; --text-sub: #9B9A97; }
+          @media (prefers-color-scheme: dark) { :root { --card-bg: #202020; --card-border: #333333; --text-title: #AFAFAF; --text-value: #FFFFFF; --text-sub: #808080; } }
           body { margin: 0; padding: 10px; overflow: hidden; background-color: transparent; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif; }
           .card { background-color: var(--card-bg); border: 1px solid var(--card-border); border-radius: 8px; height: calc(100vh - 20px); padding: 20px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: center; }
-          .header-row { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
-          .title { font-size: 13px; font-weight: 600; color: var(--text-title); text-transform: uppercase; letter-spacing: 0.5px; }
+          .title { font-size: 13px; font-weight: 600; color: var(--text-title); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
           .value { font-size: 38px; font-weight: 700; color: var(--text-value); margin-bottom: 6px; letter-spacing: -0.5px; line-height: 1; }
           .subtext { font-size: 13px; color: var(--text-sub); }
-          .icon-box { color: var(--icon-color); }
         </style>
       </head>
       <body>
         <div class="card">
-          <div class="header-row">
-            <div class="title">${widget.title}</div>
-            <div class="icon-box"><i data-feather="${widget.icon}" width="18" height="18"></i></div>
-          </div>
+          <div class="title">${widget.title}</div>
           <div class="value">${fullDisplay}</div>
           <div class="subtext">${widget.subtext}</div>
         </div>
-        <script>feather.replace();</script>
       </body>
     </html>
   `);
