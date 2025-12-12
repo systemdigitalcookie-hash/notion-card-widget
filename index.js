@@ -131,39 +131,6 @@ async function getNotionAggregatedValue(accessToken, databaseId, propertyName, c
   }
 }
 
-// --- API: LIST DATABASES ---
-app.get('/api/databases', requireAuth, async (req, res) => {
-  try {
-    const uRes = await pool.query("SELECT access_token FROM users WHERE id = $1", [req.session.userId]);
-    const user = uRes.rows[0];
-    if (!user) return res.status(401).json({ error: "User not found" });
-
-    const response = await axios.post('https://api.notion.com/v1/search', 
-      {
-        filter: { value: 'database', property: 'object' },
-        sort: { direction: 'descending', timestamp: 'last_edited_time' }
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${user.access_token}`,
-          'Notion-Version': NOTION_VERSION,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-
-    const databases = response.data.results.map(db => ({
-      id: db.id,
-      title: db.title && db.title.length > 0 ? db.title[0].plain_text : "Untitled Database",
-      icon: db.icon ? (db.icon.emoji || "📄") : "📄"
-    }));
-
-    res.json(databases);
-  } catch (error) {
-    res.status(500).json({ error: "Failed to fetch databases" });
-  }
-});
-
 // --- DEBUG ROUTE: LIST DATABASES ---
 app.get('/api/databases', requireAuth, async (req, res) => {
   console.log("1. Starting Database Search request..."); // LOG 1
