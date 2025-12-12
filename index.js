@@ -149,10 +149,10 @@ app.get('/api/databases', requireAuth, async (req, res) => {
     // 2. Search Notion for Databases
     console.log("4. Sending request to Notion API..."); // LOG 4
     const response = await axios.post('https://api.notion.com/v1/search', 
-      {
-        filter: { value: 'database', property: 'object' },
-        sort: { direction: 'descending', timestamp: 'last_edited_time' }
-      },
+    {
+      filter: { value: 'data_source', property: 'object' }, // <--- UPDATED FOR 2025 API
+      sort: { direction: 'descending', timestamp: 'last_edited_time' }
+    },
       {
         headers: {
           'Authorization': `Bearer ${user.access_token}`,
