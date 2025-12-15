@@ -613,12 +613,29 @@ app.get("/edit/:id", requireAuth, async (req, res) => {
 
 // --- ACTIONS ---
 app.post("/add", requireAuth, async (req, res) => {
-  const { title, prefix, subtext, dbId, property, calculation } = req.body;
+  const { title, icon, prefix, subtext, dbId, property, manualValue, calculation } = req.body;
+  
+  // 1. Check current count
+  const countRes = await pool.query("SELECT COUNT(*) FROM widgets WHERE user_id = $1", [req.session.userId]);
+  const widgetCount = parseInt(countRes.rows[0].count);
+
+  if (widgetCount >= 3) {
+    // If limit reached, send a simple error page or redirect
+    return res.send(`
+      <body style="font-family:sans-serif; text-align:center; padding:50px; background:#F8F9FE;">
+        <h2 style="color:#4A3B32;">🚫 Limit Reached</h2>
+        <p>You can only create 3 widgets on the free plan.</p>
+        <a href="/" style="background:#C69C6D; color:white; padding:10px 20px; text-decoration:none; border-radius:5px;">Back to Dashboard</a>
+      </body>
+    `);
+  }
+
+  // 2. If under limit, create the widget
   const id = uuidv4();
   await pool.query(
-    `INSERT INTO widgets (id, user_id, title, prefix, subtext, db_id, property, calculation)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-    [id, req.session.userId, title, prefix, subtext, dbId || null, property || null, calculation || "sum"]
+    `INSERT INTO widgets (id, user_id, title, icon, prefix, subtext, db_id, property, manual_value, calculation)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [id, req.session.userId, title, icon, prefix, subtext, dbId || null, property || null, manualValue || "0", calculation || "sum"]
   );
   res.redirect("/");
 });
