@@ -161,6 +161,8 @@ app.get('/api/databases', requireAuth, async (req, res) => {
 // --- API: GET DATABASE PROPERTIES ---
 app.get('/api/properties', requireAuth, async (req, res) => {
   const { dbId } = req.query;
+  console.log(`2. Fetching properties for DB: ${dbId}`); // <--- DEBUG LOG
+
   if (!dbId) return res.status(400).json({ error: "Missing dbId" });
 
   try {
@@ -177,6 +179,14 @@ app.get('/api/properties', requireAuth, async (req, res) => {
     });
 
     const properties = response.data.properties;
+    
+    // <--- DEBUGGING START --->
+    console.log("Raw Properties found in Notion:", Object.keys(properties));
+    Object.entries(properties).forEach(([key, val]) => {
+        console.log(`- Property: "${key}", Type: ${val.type}`);
+    });
+    // <--- DEBUGGING END --->
+
     const validProps = [];
 
     // Filter for Number, Formula, and Rollup
@@ -185,6 +195,8 @@ app.get('/api/properties', requireAuth, async (req, res) => {
          validProps.push(key);
        }
     }
+
+    console.log("Valid Props sent to UI:", validProps); // <--- DEBUG LOG
 
     res.json(validProps);
   } catch (error) {
