@@ -145,11 +145,14 @@ app.get('/api/databases', requireAuth, async (req, res) => {
       }
     );
 
-    const databases = response.data.results.map(db => ({
-      id: db.id,
-      title: db.title && db.title.length > 0 ? db.title[0].plain_text : "Untitled Database",
-      icon: db.icon ? (db.icon.emoji || "📄") : "📄"
-    }));
+    // FILTER ADDED: Exclude archived databases
+    const databases = response.data.results
+      .filter(db => !db.archived) 
+      .map(db => ({
+        id: db.id,
+        title: db.title && db.title.length > 0 ? db.title[0].plain_text : "Untitled Database",
+        icon: db.icon ? (db.icon.emoji || "📄") : "📄"
+      }));
 
     res.json(databases);
   } catch (error) {
@@ -161,7 +164,7 @@ app.get('/api/databases', requireAuth, async (req, res) => {
 // --- API: GET DATABASE PROPERTIES ---
 app.get('/api/properties', requireAuth, async (req, res) => {
   const { dbId } = req.query;
-  console.log(`2. Fetching properties for DB: ${dbId}`); // <--- DEBUG LOG
+  console.log(`2. Fetching properties for DB: ${dbId}`);
 
   if (!dbId) return res.status(400).json({ error: "Missing dbId" });
 
@@ -180,12 +183,11 @@ app.get('/api/properties', requireAuth, async (req, res) => {
 
     const properties = response.data.properties;
     
-    // <--- DEBUGGING START --->
+    // Debug Logs
     console.log("Raw Properties found in Notion:", Object.keys(properties));
     Object.entries(properties).forEach(([key, val]) => {
         console.log(`- Property: "${key}", Type: ${val.type}`);
     });
-    // <--- DEBUGGING END --->
 
     const validProps = [];
 
@@ -196,7 +198,7 @@ app.get('/api/properties', requireAuth, async (req, res) => {
        }
     }
 
-    console.log("Valid Props sent to UI:", validProps); // <--- DEBUG LOG
+    console.log("Valid Props sent to UI:", validProps);
 
     res.json(validProps);
   } catch (error) {
@@ -395,7 +397,7 @@ app.get("/", requireAuth, async (req, res) => {
                     </div>
                     <div class="col-md-6">
                        <label class="form-label text-muted small fw-bold">Subtext</label>
-                       <input type="text" name="subtext" class="form-control" placeholder="vs last month" required>
+                       <input type="text" name="subtext" class="form-control" placeholder="vs last month">
                     </div>
                     
                     <div class="col-12"><hr class="text-muted"></div>
@@ -468,8 +470,8 @@ app.get("/", requireAuth, async (req, res) => {
              }
 
              try {
-              const res = await fetch('/api/properties?dbId=' + dbId);
-              const props = await res.json();
+               const res = await fetch('/api/properties?dbId=' + dbId);
+               const props = await res.json();
                
                if (props.length === 0) {
                    select.innerHTML = '<option value="">No Number Properties Found</option>';
@@ -485,7 +487,7 @@ app.get("/", requireAuth, async (req, res) => {
                });
                select.disabled = false;
              } catch(e) { 
-                 console.log("Error fetching properties"); 
+                 console.log("Error fetching properties", e); 
                  select.innerHTML = '<option>Error</option>';
              }
           }
@@ -534,7 +536,7 @@ app.get("/edit/:id", requireAuth, async (req, res) => {
                   </div>
                   <div class="col-12">
                      <label class="form-label fw-bold small">Subtext</label>
-                     <input type="text" name="subtext" class="form-control" value="${w.subtext}" required>
+                     <input type="text" name="subtext" class="form-control" value="${w.subtext||''}">
                   </div>
 
                   <div class="col-12"><hr></div>
@@ -601,6 +603,7 @@ app.get("/edit/:id", requireAuth, async (req, res) => {
              
              if(!dbId) return;
 
+             // TYPO FIXED HERE
              try {
                const res = await fetch('/api/properties?dbId=' + dbId);
                const props = await res.json();
