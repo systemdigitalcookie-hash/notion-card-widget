@@ -468,8 +468,8 @@ app.get("/", requireAuth, async (req, res) => {
              }
 
              try {
-               constQXres = await fetch('/api/properties?dbId=' + dbId);
-               const props = awaitQXres.json();
+              const res = await fetch('/api/properties?dbId=' + dbId);
+              const props = await res.json();
                
                if (props.length === 0) {
                    select.innerHTML = '<option value="">No Number Properties Found</option>';
